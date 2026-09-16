@@ -41,6 +41,14 @@ export function updateTaskStatus(taskId: string, status: TaskStatus): Promise<Ta
   });
 }
 
+/** `assigneeId: null` unassigns the task. */
+export function assignTask(taskId: string, assigneeId: string | null): Promise<TaskDetail> {
+  return apiRequest<TaskDetail>(`/tasks/${taskId}/assignee`, {
+    method: 'PATCH',
+    body: { assigneeId },
+  });
+}
+
 export function updateTask(
   taskId: string,
   payload: Partial<Pick<CreateTaskPayload, 'title' | 'description' | 'priority'>>,
