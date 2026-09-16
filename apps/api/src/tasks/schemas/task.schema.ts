@@ -36,6 +36,10 @@ export class Task {
   @Prop({ type: Types.ObjectId, ref: 'User', required: true })
   createdBy: Types.ObjectId;
 
+  /** The project member who owns the task. Distinct from `createdBy`. */
+  @Prop({ type: Types.ObjectId, ref: 'User', default: null, index: true })
+  assigneeId?: Types.ObjectId | null;
+
   createdAt: Date;
   updatedAt: Date;
 }

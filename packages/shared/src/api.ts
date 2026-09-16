@@ -1,3 +1,4 @@
+import type { TaskActivityType } from './activity';
 import type { OrganizationRole, ProjectRole } from './roles';
 import type { TaskPriority, TaskStatus } from './tasks';
 
@@ -50,6 +51,7 @@ export interface TaskSummary {
   priority: TaskPriority;
   commentCount: number;
   createdBy: UserSummary;
+  assignee: UserSummary | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -57,6 +59,23 @@ export interface TaskSummary {
 export interface TaskDetail extends TaskSummary {
   description?: string | null;
   project: Pick<ProjectSummary, 'id' | 'name' | 'key'>;
+}
+
+/**
+ * One entry in a task's activity feed. `metadata` is a discriminated shape
+ * keyed by `type` — assignee-change is the only variant today, but the
+ * envelope is built to carry more without a breaking change.
+ */
+export interface TaskActivityEntry {
+  id: string;
+  taskId: string;
+  type: TaskActivityType;
+  actor: UserSummary;
+  metadata: {
+    from: UserSummary | null;
+    to: UserSummary | null;
+  };
+  createdAt: string;
 }
 
 export interface CommentEntry {
