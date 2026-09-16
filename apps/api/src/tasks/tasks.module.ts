@@ -2,7 +2,9 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { Comment, CommentSchema } from '../comments/schemas/comment.schema';
 import { ProjectsModule } from '../projects/projects.module';
+import { TaskActivity, TaskActivitySchema } from '../task-activity/schemas/task-activity.schema';
 import { UsersModule } from '../users/users.module';
+import { TaskCounter, TaskCounterSchema } from './schemas/task-counter.schema';
 import { Task, TaskSchema } from './schemas/task.schema';
 import { TasksController } from './tasks.controller';
 import { TasksService } from './tasks.service';
@@ -12,6 +14,8 @@ import { TasksService } from './tasks.service';
     MongooseModule.forFeature([
       { name: Task.name, schema: TaskSchema },
       { name: Comment.name, schema: CommentSchema },
+      { name: TaskActivity.name, schema: TaskActivitySchema },
+      { name: TaskCounter.name, schema: TaskCounterSchema },
     ]),
     ProjectsModule,
     UsersModule,

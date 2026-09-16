@@ -13,6 +13,7 @@ import {
 import type { Paginated, TaskDetail, TaskSummary } from '@projectflow/shared';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { toObjectId } from '../common/utils/object-id';
+import { AssignTaskDto } from './dto/assign-task.dto';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { ListTasksQueryDto } from './dto/list-tasks.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
@@ -70,9 +71,23 @@ export class TasksController {
   @Patch('tasks/:taskId/status')
   updateStatus(
     @Param('taskId') taskId: string,
+    @CurrentUser('id') userId: string,
     @Body() dto: UpdateTaskStatusDto,
   ): Promise<TaskDetail> {
-    return this.tasksService.updateStatus(toObjectId(taskId, 'task id'), dto);
+    return this.tasksService.updateStatus(
+      toObjectId(taskId, 'task id'),
+      toObjectId(userId, 'user id'),
+      dto,
+    );
+  }
+
+  @Patch('tasks/:taskId/assignee')
+  assign(
+    @Param('taskId') taskId: string,
+    @CurrentUser('id') userId: string,
+    @Body() dto: AssignTaskDto,
+  ): Promise<TaskDetail> {
+    return this.tasksService.assign(toObjectId(taskId, 'task id'), toObjectId(userId, 'user id'), dto);
   }
 
   @Delete('tasks/:taskId')

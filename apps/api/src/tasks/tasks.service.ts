@@ -1,16 +1,19 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { type FilterQuery, Model, Types } from 'mongoose';
-import type { Paginated, TaskDetail, TaskSummary } from '@projectflow/shared';
+import { TaskActivityType, type Paginated, type TaskDetail, type TaskSummary } from '@projectflow/shared';
 import { toUserSummary } from '../common/utils/serialize';
 import { Comment, type CommentDocument } from '../comments/schemas/comment.schema';
-import { canManage, ProjectAccessService } from '../projects/project-access.service';
+import { canManage, canView, ProjectAccessService } from '../projects/project-access.service';
 import { Project, type ProjectDocument } from '../projects/schemas/project.schema';
+import { TaskActivity, type TaskActivityDocument } from '../task-activity/schemas/task-activity.schema';
 import { UsersService } from '../users/users.service';
+import type { AssignTaskDto } from './dto/assign-task.dto';
 import type { CreateTaskDto } from './dto/create-task.dto';
 import type { ListTasksQueryDto } from './dto/list-tasks.dto';
 import type { UpdateTaskDto } from './dto/update-task.dto';
 import type { UpdateTaskStatusDto } from './dto/update-task-status.dto';
+import { TaskCounter, type TaskCounterDocument } from './schemas/task-counter.schema';
 import { Task, type TaskDocument } from './schemas/task.schema';
 
 @Injectable()
@@ -19,6 +22,8 @@ export class TasksService {
     @InjectModel(Task.name) private readonly taskModel: Model<TaskDocument>,
     @InjectModel(Project.name) private readonly projectModel: Model<ProjectDocument>,
     @InjectModel(Comment.name) private readonly commentModel: Model<CommentDocument>,
+    @InjectModel(TaskActivity.name) private readonly taskActivityModel: Model<TaskActivityDocument>,
+    @InjectModel(TaskCounter.name) private readonly taskCounterModel: Model<TaskCounterDocument>,
     private readonly projectAccessService: ProjectAccessService,
     private readonly usersService: UsersService,
   ) {}
@@ -58,8 +63,7 @@ export class TasksService {
   ): Promise<TaskDetail> {
     const { project } = await this.projectAccessService.assertCanView(projectId, userId);
 
-    const taskCount = await this.taskModel.countDocuments({ projectId });
-    const number = taskCount + 1;
+    const number = await this.nextTaskNumber(projectId);
 
     const task = await this.taskModel.create({
       projectId,
@@ -113,20 +117,105 @@ export class TasksService {
     return this.toDetail(task, access.project);
   }
 
-  async updateStatus(taskId: Types.ObjectId, dto: UpdateTaskStatusDto): Promise<TaskDetail> {
+  /**
+   * `assertCanView` is the deliberate fix for the reported production bug:
+   * previously this method took no `userId` at all, so any authenticated
+   * user — including someone with no relationship to the project — could
+   * move any task on the board. See BUG_REPORT.md.
+   */
+  async updateStatus(
+    taskId: Types.ObjectId,
+    userId: Types.ObjectId,
+    dto: UpdateTaskStatusDto,
+  ): Promise<TaskDetail> {
     const task = await this.findTaskOrFail(taskId);
+    const { project } = await this.projectAccessService.assertCanView(task.projectId, userId);
 
     task.status = dto.status;
     await task.save();
 
-    return this.toDetail(task);
+    return this.toDetail(task, project);
+  }
+
+  /**
+   * Assigns, reassigns or unassigns a task and records the transition in
+   * task activity. Enforces the three rules from Part Six of the brief:
+   *
+   *  1. The assignee (when not null) must be able to view the project —
+   *     i.e. actually be reachable as a project member.
+   *  2. Only OWNER / ADMIN / PROJECT_MANAGER may assign someone other than
+   *     themselves; a regular member may only assign the task to themselves.
+   *  3. The same permission line governs unassignment: an elevated/PM role
+   *     may clear anyone's assignment, a regular member may only clear
+   *     their own.
+   *
+   * A no-op assignment (new value equals the current one) is accepted but
+   * does not write an activity record — there is nothing to show in the
+   * timeline for a change that didn't happen.
+   */
+  async assign(
+    taskId: Types.ObjectId,
+    actingUserId: Types.ObjectId,
+    dto: AssignTaskDto,
+  ): Promise<TaskDetail> {
+    const task = await this.findTaskOrFail(taskId);
+    const access = await this.projectAccessService.assertCanView(task.projectId, actingUserId);
+
+    const targetAssigneeId = dto.assigneeId ? new Types.ObjectId(dto.assigneeId) : null;
+    const currentAssigneeId = task.assigneeId ?? null;
+
+    if (targetAssigneeId) {
+      const isSelfAssign = targetAssigneeId.equals(actingUserId);
+      if (!isSelfAssign && !canManage(access)) {
+        throw new ForbiddenException(
+          'You can only assign this task to yourself, not to another member',
+        );
+      }
+
+      // Rule 1: the assignee must actually belong to this project. A
+      // regular project row or an elevated org role both count, mirroring
+      // how `assertCanView` decides who may see the project at all.
+      const assigneeAccess = await this.projectAccessService.resolve(task.projectId, targetAssigneeId);
+      if (!isSelfAssign && !canView(assigneeAccess)) {
+        throw new BadRequestException('User is not a member of this project');
+      }
+    } else {
+      const isSelfUnassign = currentAssigneeId?.equals(actingUserId) ?? false;
+      if (!isSelfUnassign && !canManage(access)) {
+        throw new ForbiddenException('You do not have permission to unassign this task');
+      }
+    }
+
+    const unchanged =
+      (targetAssigneeId === null && currentAssigneeId === null) ||
+      (targetAssigneeId !== null && currentAssigneeId !== null && targetAssigneeId.equals(currentAssigneeId));
+
+    if (unchanged) {
+      return this.toDetail(task, access.project);
+    }
+
+    task.assigneeId = targetAssigneeId;
+    await task.save();
+
+    await this.taskActivityModel.create({
+      taskId: task._id,
+      type: TaskActivityType.ASSIGNEE_CHANGED,
+      actorId: actingUserId,
+      metadata: { from: currentAssigneeId, to: targetAssigneeId },
+    });
+
+    return this.toDetail(task, access.project);
   }
 
   async remove(taskId: Types.ObjectId, userId: Types.ObjectId): Promise<void> {
     const task = await this.findTaskOrFail(taskId);
     await this.projectAccessService.assertCanManage(task.projectId, userId);
 
-    await Promise.all([this.commentModel.deleteMany({ taskId: task._id }), task.deleteOne()]);
+    await Promise.all([
+      this.commentModel.deleteMany({ taskId: task._id }),
+      this.taskActivityModel.deleteMany({ taskId: task._id }),
+      task.deleteOne(),
+    ]);
   }
 
   async findTaskOrFail(taskId: Types.ObjectId): Promise<TaskDocument> {
@@ -137,13 +226,40 @@ export class TasksService {
     return task;
   }
 
+  /**
+   * Hands out the next per-project task number atomically.
+   *
+   * The original implementation read `countDocuments` and added one in a
+   * separate step, which is a classic read-then-write race: two requests
+   * that both read a count of 5 will both compute 6 and create two `-6`
+   * keyed tasks. `findOneAndUpdate` with `$inc` is a single atomic
+   * operation on MongoDB's side — every concurrent caller gets a distinct,
+   * strictly increasing value with no read/write gap for another request
+   * to land in. See ASSESSMENT_NOTES.md for the fuller writeup.
+   */
+  private async nextTaskNumber(projectId: Types.ObjectId): Promise<number> {
+    const counter = await this.taskCounterModel
+      .findOneAndUpdate(
+        { projectId },
+        { $inc: { value: 1 } },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      )
+      .exec();
+    return counter.value;
+  }
+
   private async toSummaries(tasks: TaskDocument[]): Promise<TaskSummary[]> {
     if (tasks.length === 0) {
       return [];
     }
 
-    const [creators, commentRows] = await Promise.all([
+    const assigneeIds = tasks
+      .map((task) => task.assigneeId)
+      .filter((id): id is Types.ObjectId => id != null);
+
+    const [creators, assignees, commentRows] = await Promise.all([
       this.usersService.findManyByIds(tasks.map((task) => task.createdBy)),
+      this.usersService.findManyByIds(assigneeIds),
       this.commentModel
         .aggregate<{
           _id: Types.ObjectId;
@@ -156,6 +272,7 @@ export class TasksService {
     ]);
 
     const creatorsById = new Map(creators.map((user) => [user._id.toString(), user]));
+    const assigneesById = new Map(assignees.map((user) => [user._id.toString(), user]));
     const commentCounts = new Map(commentRows.map((row) => [row._id.toString(), row.count]));
 
     return tasks.map((task) => ({
@@ -167,7 +284,10 @@ export class TasksService {
       status: task.status,
       priority: task.priority,
       commentCount: commentCounts.get(task._id.toString()) ?? 0,
-      createdBy: toCreatorSummary(creatorsById.get(task.createdBy.toString())),
+      createdBy: toSummaryOrDeleted(creatorsById.get(task.createdBy.toString())),
+      assignee: task.assigneeId
+        ? toSummaryOrDeleted(assigneesById.get(task.assigneeId.toString()))
+        : null,
       createdAt: task.createdAt.toISOString(),
       updatedAt: task.updatedAt.toISOString(),
     }));
@@ -200,6 +320,6 @@ const DELETED_USER = {
   avatarUrl: null,
 };
 
-function toCreatorSummary(user: Parameters<typeof toUserSummary>[0] | undefined) {
+function toSummaryOrDeleted(user: Parameters<typeof toUserSummary>[0] | undefined) {
   return user ? toUserSummary(user) : DELETED_USER;
 }
