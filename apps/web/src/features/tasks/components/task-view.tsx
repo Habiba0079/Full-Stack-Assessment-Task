@@ -5,8 +5,10 @@ import Link from 'next/link';
 import { Avatar } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
 import { CommentList } from '@/features/comments/components/comment-list';
+import { ActivityTimeline } from '@/features/task-activity/components/activity-timeline';
 import { formatDate } from '@/lib/format';
 import { useTask } from '../hooks';
+import { AssigneeSelect } from './assignee-select';
 import { TaskPriorityBadge } from './task-priority-badge';
 import { TaskStatusSelect } from './task-status-select';
 
@@ -81,6 +83,13 @@ export function TaskView({ projectId, taskId }: TaskViewProps) {
 
           <div className="space-y-1.5">
             <h2 className="text-[11px] font-medium uppercase tracking-wide text-subtle-foreground">
+              Assignee
+            </h2>
+            <AssigneeSelect taskId={task.id} projectId={projectId} assignee={task.assignee} />
+          </div>
+
+          <div className="space-y-1.5">
+            <h2 className="text-[11px] font-medium uppercase tracking-wide text-subtle-foreground">
               Priority
             </h2>
             <TaskPriorityBadge priority={task.priority} />
@@ -101,6 +110,10 @@ export function TaskView({ projectId, taskId }: TaskViewProps) {
               Created
             </h2>
             <p className="text-[13px] text-muted-foreground">{formatDate(task.createdAt)}</p>
+          </div>
+
+          <div className="border-t border-border pt-5">
+            <ActivityTimeline taskId={task.id} />
           </div>
         </aside>
       </div>
