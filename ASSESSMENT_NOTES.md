@@ -2,111 +2,43 @@
 
 ## Architecture
 
-**Major modules.** The API is a NestJS monorepo app organized one module
-per entity: `auth`, `users`, `organizations`, `organization-members`,
-`projects`, `project-members`, `tasks`, `comments`, and now
-`task-activity`. Each follows the same shape end to end — controller →
-service → Mongoose model, DTOs validating input at the request boundary —
-which makes the codebase predictable to extend: adding task assignment
-meant following the same shape rather than inventing a new one. `common/`
-holds cross-cutting pieces (the JWT guard, the `@CurrentUser` /
-`@Public` decorators, the global exception filter, `toObjectId`,
-`toUserSummary`, pagination DTOs) that every module reuses instead of
-re-implementing.
+**Major modules.** The API is a NestJS monorepo app organized into modules for each major entity: `auth`, `users`, `organizations`, `organization-members`, `projects`, `project-members`, `tasks`, `comments`, and now `task-activity`. Each follows the same end-to-end shape — controller → service → Mongoose model, with DTOs validating input at the request boundary. This makes the codebase predictable to extend: adding task assignment followed the same structure rather than introducing a new pattern. `common/` contains cross-cutting pieces such as the JWT guard, `@CurrentUser` / `@Public` decorators, the global exception filter, `toObjectId`, `toUserSummary`, and pagination DTOs, which are reused instead of reimplemented by individual modules.
 
-**Where business logic lives.** In the services, not the controllers.
-Controllers are thin — they parse route/query params into `ObjectId`s and
-DTOs and hand off. The one real exception was the bug this assessment
-asked to investigate: `updateStatus` had drifted to having *no*
-controller-level parameter for the user at all, which is exactly why it
-skipped the service-level check every other mutator has (see
-`BUG_REPORT.md`).
+**Where business logic lives.** Business logic belongs in services rather than controllers. Controllers are intentionally thin: they parse route/query parameters into `ObjectId`s and DTOs and delegate to services. The main exception discovered during this assessment was the status-update authorization bug: `updateStatus` did not receive the current user at the controller boundary, so it could not perform the same project-access check used by the other task mutations. This is documented in `BUG_REPORT.md`.
 
-**Frontend ↔ backend / server state.** The Next.js App Router frontend
-talks to the API through a single `apiRequest` wrapper
-(`lib/api-client.ts`) that owns the base URL, the bearer token, and error
-shape parsing, so every feature's `api.ts` file is just a thin list of
-typed endpoint calls. Server state is owned entirely by TanStack Query;
-`lib/query-keys.ts` is the single registry of cache keys so invalidation
-after a mutation is centralized and doesn't drift between features. Local
-UI state (dropdown open/closed, a filter string) stays in React state,
-never mixed into the query cache.
+**Frontend ↔ backend / server state.** The Next.js App Router frontend talks to the API through a single `apiRequest` wrapper (`lib/api-client.ts`) that owns the base URL, bearer token handling, and error-shape parsing. Each feature's `api.ts` therefore remains a thin collection of typed endpoint calls. Server state is managed by TanStack Query, while `lib/query-keys.ts` acts as the central registry for cache keys so mutation invalidation stays consistent across features. Local UI state such as dropdown visibility and filter text remains in React state rather than being mixed into the query cache.
 
-**Authentication and authorization.** Authentication is a JWT bearer
-token; `JwtAuthGuard` is registered globally via `APP_GUARD`, so every
-route requires a valid token unless explicitly marked `@Public()`.
-Authorization is centralized in one place, `ProjectAccessService`:
-`resolve()` looks up both the caller's organization role and their
-project-membership row, `assertCanView` throws unless either grants
-access (an elevated org role — `OWNER`/`ADMIN` — reaches every project in
-the org; a project-member row reaches just that project), and
-`assertCanManage` additionally requires `PROJECT_MANAGER` or an elevated
-org role. Every mutating task/comment/project-member endpoint is supposed
-to route through one of these two — the status bug was a single module
-that had silently stopped doing that.
+**Development environment and Windows compatibility.** The starter project's web development script relied on Unix-style environment-variable expansion for `WEB_PORT`, which did not work correctly when running the monorepo on Windows. This initially prevented the web development server from starting as intended. I updated the web `dev` script to use a Windows-compatible command while preserving the configured port (`3742`). After the change, `pnpm dev` successfully started both the API and web applications on Windows. The change was intentionally kept small and isolated to the development script rather than introducing an additional cross-platform dependency solely for this issue.
+
+**Authentication and authorization.** Authentication uses JWT bearer tokens. `JwtAuthGuard` is registered globally through `APP_GUARD`, so every route requires a valid token unless explicitly marked `@Public()`. Authorization is centralized through `ProjectAccessService`: `resolve()` checks both the caller's organization role and their project-membership row, `assertCanView` allows access when either the elevated organization role (`OWNER` / `ADMIN`) or a project-membership row grants it, and `assertCanManage` additionally requires `PROJECT_MANAGER` or an elevated organization role. Mutating task, comment, and project-member operations are expected to route through these access checks. The status-update bug was an isolated case where this convention had been skipped.
 
 **How the main entities relate.**
 
-```
+```text
 User
 Organization ── OrganizationMember ── User   (OWNER | ADMIN | MEMBER)
 Organization ── Project
 Project      ── ProjectMember      ── User   (PROJECT_MANAGER | MEMBER)
 Project      ── Task ── Comment
 Task         ── TaskActivity                  (new: assignee-change log)
-Task ── assigneeId → User                      (new: nullable, distinct from createdBy)
+Task ── assigneeId → User                     (new: nullable, distinct from createdBy)
 ```
 
-Membership is its own collection on both levels rather than an array on
-the parent document — indexable and queryable directly, with a unique
-compound index on the two foreign keys. Tasks are numbered per project
-via a human-readable key derived from the project key (`ENG-1`,
-`WEB-3`); that numbering is now backed by a separate `TaskCounter`
-collection incremented atomically (see "Concurrent Task Creation" below)
-rather than the project document itself, so a burst of task creation
-doesn't also contend with reads/writes of `Project`.
+Membership is stored in separate collections at both organization and project level rather than as embedded arrays on the parent documents. This keeps membership directly queryable and indexable, with unique compound indexes on the relevant foreign keys. Tasks are numbered per project using a human-readable key derived from the project key (`ENG-1`, `WEB-3`). That numbering is now backed by a dedicated `TaskCounter` collection whose value is incremented atomically, rather than relying on `countDocuments() + 1`.
 
 ## Observations — risks and weaknesses
 
-1. **No refresh tokens; access tokens are long-lived (`JWT_EXPIRES_IN`
-   defaults to `7d`) with no revocation path.** If a token leaks, it's
-   valid for up to a week with nothing short of rotating `JWT_SECRET`
-   (which invalidates every session, not just the one) to shut it down.
-   *Would fix later* — it's a real gap, but it's also exactly the kind of
-   architectural change ("add a refresh flow / token revocation list")
-   the brief explicitly asks not to take on speculatively inside a
-   4–6 hour assessment. Worth flagging loudly, not worth doing here.
+1. **No refresh tokens; access tokens are long-lived (`JWT_EXPIRES_IN` defaults to `7d`) with no revocation path.** If a token leaks, it remains valid until expiry unless `JWT_SECRET` is rotated, which would invalidate all active sessions rather than only the compromised one. *Would fix later* — this is a real security gap, but adding refresh tokens or token revocation would expand the scope of the assessment beyond the requested feature work. It is better to document the trade-off explicitly than to introduce a partially designed authentication flow under time pressure.
 
-2. **`ProjectAccessService.resolve()` runs two separate queries
-   (organization role, project role) on every single access check, and
-   nothing caches the result within a request.** A single `GET /tasks/
-   :taskId` triggers `findTaskOrFail` then `assertCanView`, which is two
-   round trips just for authorization before the actual data is even
-   touched; list endpoints that resolve access once are fine, but any
-   future endpoint that calls `assertCanView` in a loop (there isn't one
-   today) would be an N+1 waiting to happen. *Would fix later* — not
-   costly yet at this data volume, but worth a per-request memoization
-   layer if project endpoints multiply.
+2. **`ProjectAccessService.resolve()` performs two separate lookups (organization role and project role) on each access check, and there is no request-scoped memoization.** A single task-read operation can therefore perform multiple authorization queries before the actual task data is returned. Current list endpoints generally resolve access once, so this is not yet a demonstrated bottleneck, but repeated access checks across a growing number of endpoints could create unnecessary database traffic. *Would fix later* with request-scoped memoization or a carefully designed authorization context.
 
-3. **The status-update authorization bug (this assessment's Part
-   Eleven) shows the access-check pattern is a convention, not something
-   the type system enforces.** Nothing stops a future controller method
-   from being added without a `@CurrentUser()` param and without calling
-   `ProjectAccessService`, and nothing would fail until someone noticed
-   in production. *Would fix now, but out of scope for one assessment* —
-   the real fix is structural (e.g. a route-level guard/decorator that
-   requires an explicit access-check call to be proven, or an
-   interceptor that asserts every non-`@Public()` mutating handler
-   touched `ProjectAccessService`), not a one-line patch. I fixed the one
-   instance found; I did not build the general enforcement mechanism.
+3. **The status-update authorization bug shows that authorization is partly enforced by convention.** A future handler could theoretically be added without requiring the current user at the controller boundary or without calling `ProjectAccessService`, and the type system would not prevent that mistake. The assessment fix addresses the specific vulnerable endpoint and adds regression coverage. A broader structural solution would be a route-level guard/decorator pattern or another mechanism that makes the required access check harder to omit. That was intentionally kept outside the scope of this assessment because the immediate requirement was to diagnose and fix the existing vulnerability safely.
 
-4. **Task numbering was concurrency-unsafe** (`countDocuments` + 1) —
-   already covered as one of the two required fixes; see "Concurrent Task
-   Creation" below for the fix and reasoning. *Fixed now.*
+4. **Task numbering was concurrency-unsafe** because the original implementation used `countDocuments() + 1`. This has been fixed as part of the assessment using an atomic `TaskCounter` update. The reasoning and regression coverage are described in the "Concurrent Task Creation" section and in the automated tests.
 
 ## Code Review
 
-Reviewing this as a submitted PR:
+As part of the assessment, I reviewed the original task-assignment implementation as if it were a submitted pull request:
 
 ```ts
 async assignTask(taskId: string, assigneeId: string, userId: string) {
@@ -120,173 +52,57 @@ async assignTask(taskId: string, assigneeId: string, userId: string) {
 }
 ```
 
-**Correctness / business rules.** `userId` (the actor) is accepted as a
-parameter but never used. There's no check that `assigneeId` belongs to
-the task's project, and no check on who `userId` is or whether they're
-allowed to assign anyone at all — every rule from Part Six of the brief
-(project membership, assign permissions, unassignment) is simply absent.
-As written, any authenticated caller can assign any task to any user in
-the system, including a user with no relationship to the project or the
-organization.
+**Correctness / business rules.** `userId` (the actor) is accepted but never used. There is no verification that the assignee belongs to the task's project, no validation of the caller's permission to assign, and no explicit handling of unassignment. As written, an authenticated caller could assign a task to an unrelated user.
 
-**Security / authorization.** No call to `ProjectAccessService` (or
-anything like it) anywhere in this function — it's the same shape of gap
-as the reported production bug (Part Eleven), in a brand-new endpoint
-this time instead of an existing one. I'd block this PR on that alone.
+**Security / authorization.** The function has no call to `ProjectAccessService` or an equivalent authorization layer. This is the same class of issue as the production status-update bug: the mutation changes project data without proving that the actor has permission to do so. The correct implementation therefore needs actor-level access resolution and project-membership checks before changing the task.
 
-**Data consistency.** No activity record is written, so the change is
-silent — Part Seven of the brief explicitly asks for an activity trail,
-and this loses it entirely. There's also no handling for `assigneeId`
-being unset/null (unassignment) — the DTO signature `assigneeId: string`
-doesn't even allow it.
+**Data consistency.** The original implementation does not write a `TaskActivity` record, so assignment changes are invisible to the activity history. It also does not model unassignment explicitly because `assigneeId` is treated as a required string rather than an optional/null value.
 
-**Error handling.** Both `NotFoundException()` calls omit a message,
-so the client (and whoever's debugging) sees a bare 404 with no
-indication whether it was the task or the user that was missing —
-inconsistent with the rest of the codebase, where `findTaskOrFail`
-etc. always pass a message.
+**Error handling.** Both `NotFoundException()` calls omit a message, which makes failures less descriptive than the rest of the codebase, where helper methods such as `findTaskOrFail` provide contextual errors.
 
-**Performance.** Two sequential round trips (`findById` on the task,
-then `findById` on the user) where the data doesn't depend on each other
-— they could run as `Promise.all([...])`. Minor at this scale, but it's
-a pattern that compounds if copied elsewhere.
+**Performance.** The original code performs the task and user lookups sequentially even though they do not depend on one another. They could be fetched concurrently with `Promise.all()` where appropriate. This is a minor optimization rather than the primary correctness issue.
 
-**Maintainability / architecture.** `task.assignee` is written directly,
-but the actual schema field this assessment introduces is `assigneeId`
-(consistent with `createdBy`, `projectId` elsewhere in the codebase) —
-this method wouldn't even compile against the real `Task` schema. If this
-were real generated code I'd flag the naming mismatch specifically, since
-it suggests the function was written against an assumption about the
-schema rather than the schema itself.
+**Maintainability / architecture.** The original code writes `task.assignee`, while the assessment implementation uses `assigneeId` consistently with the task schema and the rest of the data model. This mismatch is a concrete indication that the function was written against an assumed schema rather than the actual one.
 
-**What I'd ask the engineer to change:** add the actor's project-access
-resolution and the three business rules from Part Six; accept
-`assigneeId: string | null` and branch on unassignment; write a
-`TaskActivity` row for every real transition; batch the two lookups;
-give both `NotFoundException`s a message; and rename the write target to
-match the actual schema field. I would not rewrite the function myself
-beyond what's needed to point out *why* each change matters — see
-`TasksService.assign()` in this codebase for the version I'd actually
-ship.
+**What I would ask the engineer to change:** resolve the actor's project access, validate that the selected assignee is a project member, enforce the assignment permission rules, support `assigneeId: string | null` for unassignment, create an activity record for every actual assignee transition, use the schema's `assigneeId` field, provide meaningful not-found errors, and parallelize independent lookups where useful. The final implementation in `TasksService.assign()` applies these rules.
 
 ## Scaling the Activity System
 
-Assume 5,000 → 500,000 users and task activity becomes one of the
-largest datasets in the system.
+Assume the system grows from roughly 5,000 to 500,000 users and task activity becomes one of the largest datasets.
 
-**Indexes.** The current `{ taskId: 1, createdAt: -1 }` compound index is
-the right shape for "give me one task's history, newest first" and stays
-correct at any scale — it's what makes the current pagination an index
-scan, not a collection scan. What it doesn't serve is any cross-task
-query ("everything I did last week", "recent activity across a
-project"); if product ever wants those views, they need their own
-indexes (e.g. `{ actorId: 1, createdAt: -1 }`, or a `{ projectId: 1,
-createdAt: -1 }` if `projectId` gets denormalized onto the activity row
-to avoid a join through `Task`). I would not add those speculatively
-today — only once a real read pattern asks for them, since every extra
-index is write-amplification on an already high-write collection.
+**Indexes.** The current `{ taskId: 1, createdAt: -1 }` compound index is appropriate for the primary access pattern: retrieving one task's activity history newest-first. It keeps the existing per-task pagination as an index-supported query rather than a collection scan. If the product later adds cross-task activity feeds, those endpoints would need indexes for their actual access patterns, such as `{ actorId: 1, createdAt: -1 }` or a `{ projectId: 1, createdAt: -1 }` index if `projectId` is denormalized onto the activity document. I would not add these speculatively because every additional index increases write cost.
 
-**Query patterns.** The read path that matters at scale is "recent
-activity for one task," which stays cheap (one task's history doesn't
-grow past a few dozen–hundred entries even for a long-lived task,
-regardless of how many users the system has). The risk is a query
-pattern nobody's built yet becoming expensive by accident — e.g., an
-admin "activity across the whole org" report would need to either scan
-per-project or maintain its own denormalized/pre-aggregated view; I
-would not build that until it's a real requirement.
+**Query patterns.** The current read pattern is "recent activity for one task." That remains relatively cheap because the activity history for a single task is expected to be small compared with the total collection size. The larger risk is introducing a cross-project or organization-wide activity feed without designing the corresponding query path first. Such a feature would need either an appropriately indexed denormalized representation or a dedicated reporting/read model.
 
-**Cursor vs. offset pagination.** Today's `skip`/`limit` is fine per-task
-because a single task's activity list is small and bounded. It stops
-being fine the moment a *feed* spans many tasks with high total volume —
-`skip(100000)` still has to walk past 100,000 documents server-side. If
-a cross-task feed becomes a real feature, I'd switch that endpoint (not
-necessarily the per-task one) to cursor-based pagination keyed on
-`(createdAt, _id)`, which turns "seek to page 4000" into an indexed
-range query instead of a skip.
+**Cursor vs. offset pagination.** The current `skip` / `limit` pagination is reasonable for a per-task timeline because a single task should not accumulate an enormous number of activity records. A cross-task feed at very high volume would be different: large `skip` values become increasingly expensive because the database must walk past skipped documents. For that use case, I would switch to cursor-based pagination using a stable `(createdAt, _id)` cursor so the next page becomes an indexed range query.
 
-**Archiving.** Per-task activity is naturally bounded and cheap to keep
-forever, but the *collection* isn't — at 500k users generating routine
-assignment churn, `task_activity` becomes one of the largest collections
-in the system by row count even though no single document is large.
-I'd move activity older than some window (e.g. 12–18 months) for
-*closed/archived projects only* to cold storage (a separate collection
-or object storage export), decided by product/compliance rather than
-guessed at here — I wouldn't archive active-project history, since
-"why was this reassigned" needs to stay queryable for as long as the
-task itself is relevant.
+**Archiving.** A single task's history is naturally bounded in practical terms, but the total activity collection can still grow substantially at 500,000 users. For closed or archived projects, activity older than a product-defined retention window (for example, 12–18 months) could be moved to a cold-storage collection or object storage. I would keep active-project history online because users may need to understand why a live task changed.
 
-**Asynchronous processing / background jobs & queues.** Writing the
-activity row synchronously inside the same request as the assignment
-change is correct today — it's one extra insert, and doing it inline
-keeps the read-your-own-write guarantee (the timeline updates the moment
-the mutation succeeds) with the simplest possible failure mode. I would
-not move it to a queue preemptively; I'd only do that if activity
-writing grew extra side effects (e.g. sending notifications, updating a
-search index) heavy enough to threaten the latency of the assignment
-request itself, at which point the write splits into "record activity
-synchronously" (cheap, stays inline) and "fan out side effects" (moves
-to a queue).
+**Asynchronous processing / background jobs & queues.** Writing the activity record synchronously with the assignment mutation is appropriate at the current scale. It adds one small write and guarantees that a successful assignment has a corresponding history entry before the API response returns. I would introduce a queue when activity starts triggering heavier side effects such as notifications, search-index updates, analytics, or other fan-out work. The core audit record itself can remain synchronous while those secondary effects become asynchronous.
 
-**Real-time updates.** Not built, and I wouldn't build it speculatively
-either — TanStack Query's cache invalidation after a mutation already
-gives the *acting* user's own browser an instant update, which covers
-the common case (you assign a task, you see it change). Multi-viewer
-live updates (someone else watching the same task sees your change
-without a refresh) would need a push mechanism (SSE or WebSockets) and
-is a legitimate "two more days" item below, but it's exactly the kind of
-addition the brief warns against reaching for without a concrete driving
-need.
+**Real-time updates.** Real-time multi-viewer updates are not implemented. TanStack Query invalidation already refreshes the acting user's own view after a mutation, which is sufficient for the current scope. If the product later requires another user watching the same task to see an assignment change immediately, SSE or WebSockets would be appropriate additions.
 
-**Caching and observability.** At 500k users the read path worth
-watching isn't activity itself but `ProjectAccessService.resolve()`,
-called on every single access check including every activity-feed
-fetch (see Observation #2) — I'd add request-scoped memoization there
-before reaching for a distributed cache. For observability, the concrete,
-boring thing I'd add first is a slow-query log threshold on Mongo and a
-per-endpoint p95 latency metric, so a regression in the activity feed
-(or anywhere else) shows up before a user reports it — not a caching
-layer or a message queue, which is exactly the "technology parade" the
-brief warns against reaching for without a demonstrated need.
+**Caching and observability.** At larger scale, I would first optimize measured bottlenecks rather than introducing a distributed cache or queue preemptively. `ProjectAccessService.resolve()` is one concrete candidate for request-scoped memoization because it is called repeatedly along protected request paths. For observability, practical first steps would be MongoDB slow-query logging and per-endpoint latency metrics, especially p95 latency for activity and authorization paths.
+
+## Verification
+
+The implementation was verified locally after the assessment changes were merged.
+
+* `pnpm build` completed successfully across the workspace.
+* `pnpm test` completed successfully with **7 test suites passed and 37 tests passed**.
+* The assignment, authorization, and concurrency regression suites all passed.
+* The application was started locally with `pnpm dev` on Windows, with both API and web applications running successfully.
+* Manual UI verification covered task assignment, assignee changes, unassignment, and the resulting activity timeline.
+* The production authorization bug was also verified manually through the API using a non-member account; the request returned `403 Forbidden` with `"You do not have access to this project"`.
 
 ## If I Had Two More Days
 
-In priority order:
+1. **Make project-access enforcement structural rather than convention-based.** The status bug demonstrated that a protected mutation can become unsafe when a handler forgets to perform the access check. I would introduce a stronger guard/decorator pattern or a static/lint-based check that makes missing authorization harder to introduce.
 
-1. **Turn the assignment/access-check convention into something
-   enforced, not just followed.** The production bug existed because
-   nothing failed when a handler skipped the authorization call. I'd add
-   either a custom decorator (`@RequiresProjectAccess()`) backed by a
-   guard, or a lint rule / test that asserts every non-`@Public()`
-   mutating controller method in `tasks`/`comments`/`projects` has a
-   corresponding `ProjectAccessService` call in its service method. This
-   is first because it's the highest-leverage fix — it prevents the
-   *next* version of the bug I already found, not just this one.
+2. **Expand the automated test suite further.** The current assessment tests run successfully in a real local environment, with all 37 tests passing across seven suites. With additional time, I would broaden coverage around edge cases such as repeated assignment to the same user, repeated unassignment, invalid member transitions, and additional concurrent task-creation scenarios rather than treating the current suite as exhaustive.
 
-2. **Actually run the test suite in a real environment and iterate.**
-   I wrote the assignment/activity/security/concurrency tests against
-   the existing patterns and confirmed they typecheck and lint cleanly,
-   but this sandbox's network allowlist blocks `fastdl.mongodb.org`, so
-   `mongodb-memory-server` can't download its binary here — I could not
-   execute `pnpm test` in this environment. Running it for real (and
-   fixing whatever a first run inevitably surfaces — off-by-ones in the
-   concurrency test's expected numbering, a fixture I got subtly wrong)
-   is squarely a "two more hours," not "two more days," item, but it's
-   first on the list precisely because it's cheap and currently
-   unverified.
+3. **Add multi-viewer live updates.** An SSE or WebSocket layer could push activity and task changes to other users currently viewing the same project, removing the need for a manual refresh.
 
-3. **Multi-viewer live updates for the activity timeline and board**
-   (SSE, given the stack already leans simple — no existing WebSocket
-   infrastructure to build on). Right now a second browser tab watching
-   the same task doesn't see an assignment change until it refetches.
-   Not urgent for a small team tool, but it's the most noticeable gap
-   between this and a "real" project-management product.
+4. **Use cursor-based pagination for any future cross-task activity feed.** The existing per-task offset pagination is sufficient for the current feature. A cross-project feed at high volume would be a better fit for cursor-based pagination from the start.
 
-4. **Cursor-based pagination for any future cross-task activity
-   view**, per the scaling section above — not needed for the per-task
-   feed as it exists today, but worth having ready before a "recent
-   activity across my projects" feature gets built on top of `skip`.
-
-5. **Refresh tokens / session revocation**, per Observation #1. Real
-   security gap, but the lowest-frequency risk of the five for a tool
-   with this current threat model (internal team tool, not
-   internet-facing consumer auth), so it's last rather than absent.
+5. **Add refresh tokens and session revocation.** This remains a meaningful authentication improvement because the current access tokens are long-lived and there is no per-session revocation path. It was intentionally left outside the assessment scope.
