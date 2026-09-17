@@ -2,7 +2,7 @@
 
 ProjectFlow is a lightweight project and task tracker for software teams.
 Organizations own projects, projects own tasks, and tasks carry a status, a
-priority and a discussion thread.
+priority, an assignee, an activity history, and a discussion thread.
 
 It is a TypeScript monorepo: a NestJS + MongoDB API and a Next.js App Router
 frontend, sharing a small package of domain types and enums.
@@ -165,7 +165,8 @@ projectflow/
 │   │   │   ├── organization-members/
 │   │   │   ├── projects/        projects + ProjectAccessService
 │   │   │   ├── project-members/
-│   │   │   ├── tasks/
+│   │   │   ├── tasks/            tasks, assignment, status
+│   │   │   ├── task-activity/    assignee-change history feed
 │   │   │   ├── comments/
 │   │   │   ├── common/          guards, decorators, filters, shared DTOs
 │   │   │   └── database/seed.ts
@@ -175,7 +176,7 @@ projectflow/
 │       └── src/
 │           ├── app/             routes and layouts
 │           ├── components/      design system primitives + app shell
-│           ├── features/        auth, projects, tasks, comments
+│           ├── features/        auth, projects, tasks, task-activity, comments
 │           ├── lib/             API client, query keys, formatting
 │           └── providers/       TanStack Query provider
 │
@@ -199,6 +200,8 @@ Organization        ── OrganizationMember ── User      (OWNER | ADMIN | 
 Organization  ── Project
 Project             ── ProjectMember      ── User      (PROJECT_MANAGER | MEMBER)
 Project       ── Task ── Comment
+Task                 ── TaskActivity                    (assignee-change log)
+Task ── assigneeId → User                                (nullable, distinct from createdBy)
 ```
 
 Membership is stored in its own collection rather than as arrays on the parent
@@ -239,10 +242,12 @@ POST   /projects/:projectId/tasks
 GET    /tasks/:taskId
 PATCH  /tasks/:taskId
 PATCH  /tasks/:taskId/status
+PATCH  /tasks/:taskId/assignee
 DELETE /tasks/:taskId
 
 GET    /tasks/:taskId/comments
 POST   /tasks/:taskId/comments
+GET    /tasks/:taskId/activity
 ```
 
 Errors share one shape:
@@ -265,3 +270,53 @@ parsing.
 
 Components are server components by default; `"use client"` is added only where
 interactivity or hooks require it.
+
+---
+
+## Technical decisions
+
+- **Task assignment (`PATCH /tasks/:taskId/assignee`, `assigneeId: string |
+  null`).** One endpoint handles assign, reassign, and unassign rather than
+  three, since they're the same operation (set the field, decide who's
+  allowed to, log the transition) with different inputs. The DTO requires
+  the field explicitly (not `@IsOptional()`) so a call always states its
+  intent instead of a partial-update body silently leaving the assignee
+  untouched.
+- **Task activity as its own collection and module**, not an array field
+  on `Task`. Mirrors how membership is already modelled in this codebase
+  (its own indexed collection, not an array on the parent) and keeps the
+  activity feed's own index (`{ taskId: 1, createdAt: -1 }`) independent
+  of the task document's size.
+- **Atomic per-project task counter (`TaskCounter`, incremented via
+  `findOneAndUpdate({ $inc })`)** replacing `countDocuments() + 1` for task
+  numbering — see `ASSESSMENT_NOTES.md` and the commit history for the
+  concurrency reasoning. A dedicated counter collection was chosen over
+  adding a counter field to `Project` so a burst of task creation doesn't
+  also contend with reads/writes of the project document.
+- **Frontend: optimistic update with rollback for the assignee selector**,
+  not a loading spinner. See the doc comment on `useAssignTask` in
+  `apps/web/src/features/tasks/hooks.ts` for the reasoning.
+- **Frontend: `DropdownMenu`, not `Select`, for the assignee combobox.**
+  Radix `Select`'s content isn't a good host for a free-text search input;
+  `DropdownMenu` (already used elsewhere in the app) is. See `AI_LOG.md`.
+
+## Known limitations
+
+- **No refresh tokens or session revocation** — see `ASSESSMENT_NOTES.md`
+  → Observations. Access tokens are valid for `JWT_EXPIRES_IN` (7 days by
+  default) with no way to invalidate a single one early.
+- **No real-time updates.** A second browser tab viewing the same task
+  won't see someone else's assignment change until it refetches (its own
+  actions update instantly via the query cache; other people's don't
+  propagate live). See `ASSESSMENT_NOTES.md` → Scaling → "Real-time
+  updates."
+- **Cross-task activity views aren't supported.** The activity API and
+  index are shaped for "one task's history," not "everything a user did"
+  or "everything that happened in a project." See `ASSESSMENT_NOTES.md` →
+  Scaling for what that would need.
+- **The e2e tests in this submission were written but not executed
+  against a real MongoDB before commit** — the sandbox this was developed
+  in blocks `mongodb-memory-server`'s binary download. They do typecheck
+  and lint cleanly and follow the existing fixture patterns exactly, but
+  please run `pnpm test` to confirm before relying on them. Full context
+  in `AI_LOG.md`.
